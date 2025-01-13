@@ -18,8 +18,8 @@ import type {
 
 } from "@shared/ExtensionMessage";
 
-import type { ModelProvider } from "../api";
-import type { ApiStream } from "../api/transform/stream";
+import type { ModelProvider } from "../api-legacy";
+import type { ApiStream } from "../api-legacy/transform/stream";
 
 import type { ReclineProvider } from "./webview/ReclineProvider";
 import type { AssistantMessageContent, ToolParamName, ToolUseName } from "./assistant-message";
@@ -28,10 +28,9 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import * as path from "node:path";
 
-import delay from "delay";
 import * as vscode from "vscode";
 import pWaitFor from "p-wait-for";
-import { cloneDeep } from "es-toolkit";
+import { cloneDeep, delay } from "es-toolkit";
 import { serializeError } from "serialize-error";
 
 import { findLastIndex } from "@shared/array";
@@ -44,14 +43,14 @@ import { combineCommandSequences, COMMAND_REQ_APP_STRING } from "@shared/combine
 
 import { GlobalFileNames } from "@extension/constants";
 
-import { buildApiHandler } from "../api";
 import { listFiles } from "../services/fd";
 import { fileExistsAtPath } from "../utils/fs";
+import { buildApiHandler } from "../api-legacy";
 import { calculateApiCost } from "../utils/cost";
 import { sanitizeUserInput } from "../utils/sanitize";
 import { regexSearchFiles } from "../services/ripgrep";
-import { OpenAIModelProvider } from "../api/providers/openai";
 import { arePathsEqual, getReadablePath } from "../utils/path";
+import { OpenAIModelProvider } from "../api-legacy/providers/openai";
 import { BrowserSession } from "../integrations/browser/BrowserSession";
 import { extractTextFromFile } from "../integrations/misc/extract-text";
 import { DiffViewProvider } from "../integrations/editor/DiffViewProvider";

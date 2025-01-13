@@ -6,7 +6,7 @@ import type {
   OpenAiNativeModelId
 } from "@shared/api";
 
-import type { ModelProvider } from "../";
+import type { ModelProvider } from "..";
 import type { ApiStream } from "../transform/stream";
 
 import OpenAI from "openai";

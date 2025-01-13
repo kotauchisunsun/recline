@@ -21,7 +21,7 @@ import { Recline } from "@extension/core/Recline";
 import { GlobalFileNames } from "@extension/constants";
 
 import { openMention } from "../mentions";
-import { buildApiHandler } from "../../api";
+import { buildApiHandler } from "../../api-legacy";
 import { fileExistsAtPath } from "../../utils/fs";
 import { McpHub } from "../../services/mcp/McpHub";
 import { getTheme } from "../../integrations/theme/getTheme";

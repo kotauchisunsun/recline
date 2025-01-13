@@ -2,7 +2,7 @@ import type { Anthropic } from "@anthropic-ai/sdk";
 
 import type { ApiHandlerOptions, DeepSeekModelId, ModelInfo } from "@shared/api";
 
-import type { ModelProvider } from "../";
+import type { ModelProvider } from "..";
 import type { ApiStream } from "../transform/stream";
 
 import OpenAI from "openai";

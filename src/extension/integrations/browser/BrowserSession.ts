@@ -6,8 +6,8 @@ import type { BrowserActionResult } from "@shared/ExtensionMessage";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
-import delay from "delay";
 import pWaitFor from "p-wait-for";
+import { delay } from "es-toolkit";
 import PCR from "puppeteer-chromium-resolver";
 import { TimeoutError } from "puppeteer-core";
 

@@ -1,65 +1,155 @@
-import type { Anthropic } from "@anthropic-ai/sdk";
+import type { ChatHistoryLike, LLMSpecificModel, ModelDescriptor } from "@lmstudio/sdk";
 
-import type { ApiHandlerOptions, ModelInfo } from "@shared/api";
+import type { MessageParamWithTokenCount } from "@shared/api";
 
-import type { ModelProvider } from "../";
-import type { ApiStream } from "../transform/stream";
+import type { Model, ProviderResponseStream } from "../types";
+import type { APIModelProviderConfig } from "../api.provider";
 
-import OpenAI from "openai";
+import { LMStudioClient } from "@lmstudio/sdk";
 
-import { openAiModelInfoSaneDefaults } from "@shared/api";
+import { extractMessageFromThrow } from "@shared/utils/exception";
 
-import { convertToOpenAiMessages } from "../transform/openai-format";
+import { APIModelProvider } from "../api.provider";
+import { LMStudioTransformer } from "../transformers/lmstudio";
 
 
-export class LmStudioModelProvider implements ModelProvider {
-  private client: OpenAI;
-  private options: ApiHandlerOptions;
+export const lmStudioSaneDefaultModel: Omit<Model, "id"> = {
+  outputLimit: 32_768,
+  contextWindow: 128_000,
+  supportsImages: true,
+  supportsPromptCache: false
+};
 
-  constructor(options: ApiHandlerOptions) {
-    this.options = options;
-    this.client = new OpenAI({
-      baseURL: `${this.options.lmStudioBaseUrl || "http://localhost:1234"}/v1`,
-      apiKey: "noop"
+interface LMStudioModelProviderConfig extends APIModelProviderConfig {}
+
+export class LMStudioProvider extends APIModelProvider<LMStudioModelProviderConfig> {
+
+  protected override client: LMStudioClient | null = null;
+  private model: LLMSpecificModel | null = null;
+
+  constructor({ apiBaseURL, ...options }: Record<string, unknown>) {
+    super("LMStudio", {
+      ...options,
+      apiBaseURL: (apiBaseURL as string) || "http://localhost:8080"
     });
   }
 
-  async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
-    const openAiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-      { role: "system", content: systemPrompt },
-      ...convertToOpenAiMessages(messages)
-    ];
-
-    try {
-      const model = await this.getModel();
-      const stream = await this.client.chat.completions.create({
-        model: model.id,
-        messages: openAiMessages,
-        temperature: 0,
-        stream: true
-      });
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta;
-        if (delta?.content) {
-          yield {
-            type: "text",
-            text: delta.content
-          };
-        }
+  protected async onDispose(): Promise<void> {
+    if (this.client != null && this.model != null) {
+      try {
+        await this.client.llm.unload(this.config.modelId);
+      }
+      catch (error: unknown) {
+        console.error(`Recline <${this.name}> Failed to unload model: ${extractMessageFromThrow(error)}`);
       }
     }
-    catch (error) {
-      // LM Studio doesn't return an error code/body for now
-      throw new Error(
-        "Please check the LM Studio developer logs to debug what went wrong. You may need to load the model with a larger context length to work with Recline's prompts."
-      );
+    this.client = null;
+    this.model = null;
+  }
+
+  protected async onInitialize(): Promise<void> {
+    this.client = new LMStudioClient({
+      baseUrl: this.config.apiBaseURL
+    });
+
+    this.model = await this.client.llm.load(this.config.modelId, {
+      config: {
+        gpuOffload: {
+          ratio: "max",
+          mainGpu: 0,
+          tensorSplit: [1, 1, 1] // TODO: These values were auto-completed by AI. This needs to be researched and replaced.
+        }
+      },
+
+      // @ts-expect-error: The docs mention this option, but it's not in the types. Including anyway as this functionality would be ideal.
+      noHup: true,
+
+      onProgress: (progress: number): void => {
+        console.log(`Recline <${this.name}> Loading model... ${(progress * 100).toFixed(1)}%`);
+      }
+    });
+  }
+
+  async *createResponseStream(systemPrompt: string, messages: MessageParamWithTokenCount[]): ProviderResponseStream {
+
+    if (this.client != null || this.model != null) {
+      throw new Error(`Recline <${this.name}> Not initialized`);
+    }
+
+    // Convert messages to LMStudio format
+    // TODO: Formatter
+    const lmStudioMessages: ChatHistoryLike = {
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...LMStudioTransformer.toExternalMessages(messages)
+      ]
+    };
+
+    // Create prediction stream
+    const prediction = this.model.respond(lmStudioMessages, {
+      temperature: 0.3, // TODO: configurable
+      maxPredictedTokens: lmStudioSaneDefaultModel.outputLimit // TODO: Replace
+    });
+
+    // Stream text chunks
+    for await (const { content } of prediction) {
+      if (content != null && content.length > 0) {
+        yield {
+          type: "text",
+          content
+        };
+      }
+    }
+
+    // Get final stats and yield usage info
+    const { stats } = await prediction;
+
+    if (stats != null) {
+      yield {
+        type: "usage",
+        inputTokenCount: stats.promptTokensCount ?? 0,
+        outputTokenCount: stats.predictedTokensCount ?? 0
+      };
     }
   }
 
-  async getModel(): Promise<{ id: string; info: ModelInfo }> {
+  async getAllModels(): Promise<Model[]> {
+
+    if (this.client == null) {
+      throw new Error(`Recline <${this.name}> Client not initialized.`);
+    }
+
+    // Due to limitations of the LMStudio SDK (still in beta), we can't get a list of all models including all required data.
+    // We'll have to get each model's information individually.
+
+    const lmStudioModels: ModelDescriptor[] = await this.client.llm.listLoaded();
+
+    return Promise.all(
+      lmStudioModels.map(
+        async ({ identifier }: ModelDescriptor): Promise<Model> => this.getModel(identifier)
+      )
+    );
+  }
+
+  async getCurrentModel(): Promise<Model> {
+
+    return this.getModel(this.config.modelId);
+  }
+
+  async getModel(identifier: string): Promise<Model> {
+
+    if (this.client == null) {
+      throw new Error(`Recline <${this.name}> Client not initialized.`);
+    }
+
+    const model: LLMSpecificModel = await this.client.llm.get({ identifier });
+
     return {
-      id: this.options.lmStudioModelId || "",
-      info: openAiModelInfoSaneDefaults
+      id: identifier,
+      outputLimit: lmStudioSaneDefaultModel.outputLimit, // TODO: Replace
+      contextWindow: await model.getContextLength(),
+      supportsImages: false,
+      supportsPromptCache: false
     };
   }
 }

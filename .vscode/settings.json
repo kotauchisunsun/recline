@@ -32,5 +32,8 @@
     "yaml",
     "css"
   ],
-  "svg.preview.background": "editor"
+  "svg.preview.background": "editor",
+  "cSpell.words": [
+    "ollama"
+  ]
 }

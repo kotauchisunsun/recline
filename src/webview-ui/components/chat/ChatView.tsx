@@ -6,7 +6,7 @@ import type {
   ReclineSayTool
 } from "@shared/ExtensionMessage";
 
-import debounce from "debounce";
+import { debounce } from "es-toolkit";
 import styled from "styled-components";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { VSCodeButton } from "@vscode/webview-ui-toolkit/react";
@@ -573,7 +573,7 @@ function ChatView({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
           });
         },
         10,
-        { immediate: true }
+        { edges: ["leading"] }
       ),
     []
   );

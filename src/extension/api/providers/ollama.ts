@@ -1,57 +1,124 @@
-import type { Anthropic } from "@anthropic-ai/sdk";
+import type { Message } from "ollama";
 
-import type { ApiHandlerOptions, ModelInfo } from "@shared/api";
+import type { MessageParamWithTokenCount } from "@shared/api";
 
-import type { ModelProvider } from "../";
-import type { ApiStream } from "../transform/stream";
+import type { Model, ProviderResponseStream } from "../types";
+import type { APIModelProviderConfig } from "../api.provider";
 
-import OpenAI from "openai";
+import { Ollama } from "ollama";
 
-import { openAiModelInfoSaneDefaults } from "@shared/api";
+import { extractMessageFromThrow } from "@shared/utils/exception";
 
-import { convertToOpenAiMessages } from "../transform/openai-format";
+import { APIModelProvider } from "../api.provider";
+import { OllamaTransformer } from "../transformers/ollama";
 
 
-export class OllamaModelProvider implements ModelProvider {
-  private client: OpenAI;
-  private options: ApiHandlerOptions;
+export const ollamaSaneDefaultModel: Omit<Model, "id"> = {
+  outputLimit: 32_768,
+  contextWindow: 128_000,
+  supportsImages: true,
+  supportsPromptCache: false
+};
 
-  constructor(options: ApiHandlerOptions) {
-    this.options = options;
-    this.client = new OpenAI({
-      baseURL: `${this.options.ollamaBaseUrl || "http://localhost:11434"}/v1`,
-      apiKey: "ollama"
+export interface OllamaModelProviderConfig extends APIModelProviderConfig {}
+
+export class OllamaModelProvider<TConfig extends OllamaModelProviderConfig> extends APIModelProvider<TConfig> {
+
+  protected override client: Ollama | null = null;
+
+  constructor({ apiBaseURL, ...options }: Record<string, unknown>) {
+    super("Ollama", {
+      ...options,
+      apiBaseURL: (apiBaseURL as string) || "https://api.deepseek.com"
     });
   }
 
-  async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
-    const openAiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+  protected async onDispose(): Promise<void> {
+
+    if (this.client == null) {
+      return;
+    }
+
+    this.client.abort();
+    this.client = null;
+  }
+
+  protected async onInitialize(): Promise<void> {
+    this.client = new Ollama({
+      host: this.config.apiBaseURL
+    });
+  }
+
+  async *createResponseStream(systemPrompt: string, messages: MessageParamWithTokenCount[]): ProviderResponseStream {
+
+    await this.initialize();
+
+    // Sanity-check
+    if (this.client == null) {
+      throw new Error("Ollama client is not initialized.");
+    }
+
+    const ollamaMessages: Message[] = [
       { role: "system", content: systemPrompt },
-      ...convertToOpenAiMessages(messages)
+      ...OllamaTransformer.toExternalMessages(messages)
     ];
 
-    const model = await this.getModel();
-    const stream = await this.client.chat.completions.create({
+    const model = await this.getCurrentModel();
+    const stream = await this.client.chat({
       model: model.id,
-      messages: openAiMessages,
-      temperature: 0,
+      messages: ollamaMessages,
       stream: true
     });
+
     for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta;
-      if (delta?.content) {
+
+      if (chunk.message.content != null && chunk.message.content.length > 0) {
         yield {
           type: "text",
-          text: delta.content
+          content: chunk.message.content
         };
+      }
+
+      if (chunk.message.images != null && chunk.message.images.length > 0) {
+        for (const image of chunk.message.images) {
+          yield {
+            type: "image",
+            content: image,
+            contentType: "image/*"
+          };
+        }
       }
     }
   }
 
-  async getModel(): Promise<{ id: string; info: ModelInfo }> {
+  async getAllModels(): Promise<Model[]> {
+
+    // Sanity-check
+    if (this.client == null) {
+      throw new Error("Ollama client is not initialized.");
+    }
+
+    const ollamaModels = await this.client.list();
+
+    return ollamaModels.models.map(modelResponse => ({
+      id: modelResponse.name,
+      ...ollamaSaneDefaultModel // TODO: Map correctly...
+    }));
+  }
+
+  async getCurrentModel(): Promise<Model> {
+
+    // Sanity-check
+    if (this.client == null) {
+      throw new Error("Ollama client is not initialized.");
+    }
+
+    const metadata = await this.client.show({ model: this.config.modelId });
+
     return {
-      id: this.options.ollamaModelId || "",
-      info: openAiModelInfoSaneDefaults
+      id: this.config.modelId,
+      ...ollamaSaneDefaultModel, // TODO: Map correctly...
+      ...metadata.model_info // TODO: Map correctly...
     };
   }
 }

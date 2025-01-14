@@ -72,7 +72,7 @@ export class LMStudioProvider extends APIModelProvider<LMStudioModelProviderConf
 
   async *createResponseStream(systemPrompt: string, messages: MessageParamWithTokenCount[]): ProviderResponseStream {
 
-    if (this.client != null || this.model != null) {
+    if (this.client == null || this.model == null) {
       throw new Error(`Recline <${this.name}> Not initialized`);
     }
 
@@ -80,7 +80,7 @@ export class LMStudioProvider extends APIModelProvider<LMStudioModelProviderConf
     // TODO: Formatter
     const lmStudioMessages: ChatHistoryLike = {
       messages: [
-        { role: "system", content: systemPrompt },
+        { role: "system", content: [{ type: "text", text: systemPrompt }] },
         ...LMStudioTransformer.toExternalMessages(messages)
       ]
     };

@@ -48,3 +48,4 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_name: recline.vsix
           asset_path: ./*.vsix
+          asset_content_type: application/octet-stream

@@ -7,6 +7,7 @@ export interface Model {
 
   supportsImages: boolean;
   supportsPromptCache: boolean;
+  supportsComputerUse: boolean;
 
   inputPrice?: number;
   outputPrice?: number;
@@ -29,6 +30,9 @@ export interface ProviderResponseStreamUsageChunk {
   type: "usage";
   inputTokenCount: number;
   outputTokenCount: number;
+  cacheWriteTokenCount?: number;
+  cacheReadTokenCount?: number;
+  totalCost?: number; // An override to allow the provider to specify the cost of the usage.
 }
 
 export type ProviderResponseStreamChunk = ProviderResponseStreamTextChunk | ProviderResponseStreamImageChunk | ProviderResponseStreamUsageChunk;

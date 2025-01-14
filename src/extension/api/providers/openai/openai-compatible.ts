@@ -4,8 +4,6 @@ import type { Model, ProviderResponseStream } from "@extension/api/types";
 
 import OpenAI from "openai";
 
-import { extractMessageFromThrow } from "@shared/utils/exception";
-
 import { APIModelProvider, type APIModelProviderConfig } from "@extension/api/api.provider";
 import { OpenAICompatibleTransformer } from "@extension/api/transformers/openai-compatible";
 
@@ -38,8 +36,6 @@ export abstract class OpenAICompatibleModelProvider<TConfig extends OpenAICompat
   }
 
   async *createResponseStream(systemPrompt: string, messages: MessageParamWithTokenCount[]): ProviderResponseStream {
-
-    await this.initialize();
 
     const openAiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: "system", content: systemPrompt },

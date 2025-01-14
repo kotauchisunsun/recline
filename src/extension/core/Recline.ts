@@ -18,8 +18,8 @@ import type {
 
 } from "@shared/ExtensionMessage";
 
-import type { ModelProvider } from "../api-legacy";
-import type { ApiStream } from "../api-legacy/transform/stream";
+import type { ProviderResponseStream } from "@extension/api/types";
+import type { ModelProvider, ModelProviderConfig } from "@extension/api/provider";
 
 import type { ReclineProvider } from "./webview/ReclineProvider";
 import type { AssistantMessageContent, ToolParamName, ToolUseName } from "./assistant-message";
@@ -39,18 +39,19 @@ import {
   browserActions
 } from "@shared/ExtensionMessage";
 import { combineApiRequests } from "@shared/combineApiRequests";
+import { extractExceptionFromThrow } from "@shared/utils/exception";
 import { combineCommandSequences, COMMAND_REQ_APP_STRING } from "@shared/combineCommandSequences";
 
 import { GlobalFileNames } from "@extension/constants";
+import { modelProviderRegistrar } from "@extension/api";
+import { StatefulModelProvider } from "@extension/api/stateful.provider";
 
 import { listFiles } from "../services/fd";
 import { fileExistsAtPath } from "../utils/fs";
-import { buildApiHandler } from "../api-legacy";
 import { calculateApiCost } from "../utils/cost";
 import { sanitizeUserInput } from "../utils/sanitize";
 import { regexSearchFiles } from "../services/ripgrep";
 import { arePathsEqual, getReadablePath } from "../utils/path";
-import { OpenAIModelProvider } from "../api-legacy/providers/openai";
 import { BrowserSession } from "../integrations/browser/BrowserSession";
 import { extractTextFromFile } from "../integrations/misc/extract-text";
 import { DiffViewProvider } from "../integrations/editor/DiffViewProvider";
@@ -75,7 +76,7 @@ const cwd
 
 type ToolResponse = string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>;
 type UserContent = Array<
-  Anthropic.TextBlockParam | Anthropic.ImageBlockParam | Anthropic.ToolUseBlockParam | Anthropic.ToolResultBlockParam
+  Anthropic.TextBlockParam | Anthropic.ImageBlockParam | Anthropic.ToolUseBlockParam | Anthropic.ToolResultBlockParam | Anthropic.DocumentBlockParam
 >;
 
 export class Recline {
@@ -87,7 +88,6 @@ export class Recline {
   private browserSession: BrowserSession;
   private consecutiveAutoApprovedRequestsCount: number = 0;
   private consecutiveMistakeCount: number = 0;
-  // streaming
   private currentStreamingContentIndex = 0;
   private didAlreadyUseTool = false;
   private didCompleteReadingStream = false;
@@ -103,7 +103,7 @@ export class Recline {
 
   private userMessageContentReady = false;
   abandoned = false;
-  api: ModelProvider;
+  api: ModelProvider<ModelProviderConfig>;
   apiConversationHistory: MessageParamWithTokenCount[] = [];
   autoApprovalSettings: AutoApprovalSettings;
   customInstructions?: string;
@@ -113,7 +113,7 @@ export class Recline {
 
   constructor(
     provider: ReclineProvider,
-    apiConfiguration: ApiConfiguration,
+    { apiProvider, ...apiProviderOptions }: ApiConfiguration,
     autoApprovalSettings: AutoApprovalSettings,
     customInstructions?: string,
     task?: string,
@@ -121,7 +121,12 @@ export class Recline {
     historyItem?: HistoryItem
   ) {
     this.providerRef = new WeakRef(provider);
-    this.api = buildApiHandler(apiConfiguration);
+
+    this.api = modelProviderRegistrar.buildProvider(
+      apiProvider,
+      apiProviderOptions
+    );
+
     this.terminalManager = new TerminalManager();
     this.browserSession = new BrowserSession(provider.context);
     this.diffViewProvider = new DiffViewProvider(cwd);
@@ -129,18 +134,16 @@ export class Recline {
     this.autoApprovalSettings = autoApprovalSettings;
     if (historyItem) {
       this.taskId = historyItem.id;
-      this.resumeTaskFromHistory();
+      void this.resumeTaskFromHistory();
     }
-    else if (task || images) {
+    else if (task != null || images != null) {
       this.taskId = Date.now().toString();
-      this.startTask(task, images);
+      void this.startTask(task, images);
     }
     else {
       throw new Error("Either historyItem or task/images must be provided");
     }
   }
-
-  // Storing task to disk for history
 
   private async addToApiConversationHistory(message: MessageParamWithTokenCount): Promise<void> {
     this.apiConversationHistory.push(message);
@@ -154,7 +157,7 @@ export class Recline {
 
   private async ensureTaskDirectoryExists(): Promise<string> {
     const globalStoragePath = this.providerRef.deref()?.context.globalStorageUri.fsPath;
-    if (!globalStoragePath) {
+    if (globalStoragePath == null || globalStoragePath.length === 0) {
       throw new Error("Global storage uri is invalid");
     }
     const taskDir = path.join(globalStoragePath, "tasks", this.taskId);
@@ -166,7 +169,7 @@ export class Recline {
     const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.apiConversationHistory);
     const fileExists = await fileExistsAtPath(filePath);
     if (fileExists) {
-      return JSON.parse(await fs.readFile(filePath, "utf8"));
+      return JSON.parse(await fs.readFile(filePath, "utf8")) as MessageParamWithTokenCount[];
     }
     return [];
   }
@@ -174,13 +177,13 @@ export class Recline {
   private async getSavedReclineMessages(): Promise<ReclineMessage[]> {
     const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.uiMessages);
     if (await fileExistsAtPath(filePath)) {
-      return JSON.parse(await fs.readFile(filePath, "utf8"));
+      return JSON.parse(await fs.readFile(filePath, "utf8")) as ReclineMessage[];
     }
     else {
       // check old location
       const oldPath = path.join(await this.ensureTaskDirectoryExists(), "claude_messages.json");
       if (await fileExistsAtPath(oldPath)) {
-        const data = JSON.parse(await fs.readFile(oldPath, "utf8"));
+        const data = JSON.parse(await fs.readFile(oldPath, "utf8")) as ReclineMessage[];
         await fs.unlink(oldPath); // remove old file
         return data;
       }
@@ -206,8 +209,8 @@ export class Recline {
       }
       else {
         // this.say(
-        // 	"tool",
-        // 	"Recline responded with only text blocks but has not called attempt_completion yet. Forcing him to continue with task..."
+        //  "tool",
+        //  "Recline responded with only text blocks but has not called attempt_completion yet. Forcing him to continue with task..."
         // )
         nextUserContent = [
           {
@@ -220,17 +223,17 @@ export class Recline {
     }
   }
 
-  private async overwriteApiConversationHistory(newHistory: MessageParamWithTokenCount[]) {
+  private async overwriteApiConversationHistory(newHistory: MessageParamWithTokenCount[]): Promise<void> {
     this.apiConversationHistory = newHistory;
     await this.saveApiConversationHistory();
   }
 
-  private async overwriteReclineMessages(newMessages: ReclineMessage[]) {
+  private async overwriteReclineMessages(newMessages: ReclineMessage[]): Promise<void> {
     this.reclineMessages = newMessages;
     await this.saveReclineMessages();
   }
 
-  private async resumeTaskFromHistory() {
+  private async resumeTaskFromHistory(): Promise<void> {
     const modifiedReclineMessages = await this.getSavedReclineMessages();
 
     // Remove any resume messages that may have been added before
@@ -247,9 +250,17 @@ export class Recline {
       modifiedReclineMessages,
       m => m.type === "say" && m.say === "api_req_started"
     );
+
     if (lastApiReqStartedIndex !== -1) {
+
       const lastApiReqStarted = modifiedReclineMessages[lastApiReqStartedIndex];
-      const { cost, cancelReason }: ReclineApiReqInfo = JSON.parse(lastApiReqStarted.text || "{}");
+
+      const { cost, cancelReason }: ReclineApiReqInfo = JSON.parse(
+        lastApiReqStarted.text != null && lastApiReqStarted.text.length > 0
+          ? lastApiReqStarted.text
+          : "{}"
+      ) as ReclineApiReqInfo;
+
       if (cost == null && cancelReason == null) {
         modifiedReclineMessages.splice(lastApiReqStartedIndex, 1);
       }
@@ -267,12 +278,12 @@ export class Recline {
     // const lastReclineMessage = this.reclineMessages[lastReclineMessageIndex]
     // could be a completion result with a command
     // const secondLastReclineMessage = this.reclineMessages
-    // 	.slice()
-    // 	.reverse()
-    // 	.find(
-    // 		(m, index) =>
-    // 			index !== lastReclineMessageIndex && !(m.ask === "resume_task" || m.ask === "resume_completed_task")
-    // 	)
+    //  .slice()
+    //  .reverse()
+    //  .find(
+    //   (m, index) =>
+    //    index !== lastReclineMessageIndex && !(m.ask === "resume_task" || m.ask === "resume_completed_task")
+    //  )
     // (lastReclineMessage?.ask === "command" && secondLastReclineMessage?.ask === "completion_result")
 
     let askType: ReclineAsk;
@@ -374,7 +385,8 @@ export class Recline {
         const existingUserContent: UserContent = Array.isArray(lastMessage.content)
           ? lastMessage.content
           : [{ type: "text", text: lastMessage.content }];
-        if (previousAssistantMessage && previousAssistantMessage.role === "assistant") {
+
+        if (previousAssistantMessage != null && previousAssistantMessage.role === "assistant") {
           const assistantContent = Array.isArray(previousAssistantMessage.content)
             ? previousAssistantMessage.content
             : [{ type: "text", text: previousAssistantMessage.content }];
@@ -441,7 +453,9 @@ export class Recline {
       return "just now";
     })();
 
-    const wasRecent = lastReclineMessage?.ts && Date.now() - lastReclineMessage.ts < 30_000;
+    const wasRecent = (
+      lastReclineMessage?.ts != null && ((Date.now() - lastReclineMessage.ts) < 30_000)
+    );
 
     newUserContent.push({
       type: "text",
@@ -449,7 +463,7 @@ export class Recline {
         `[TASK RESUMPTION] This task was interrupted ${agoText}. It may or may not be complete, so please reassess the task context. Be aware that the project state may have changed since then. The current working directory is now '${cwd.toPosix()}'. If the task has not been completed, retry the last step before interruption and proceed with completing the task.\n\nNote: If you previously attempted a tool use that the user did not provide a result for, you should assume the tool use was not successful and assess whether you should retry. If the last tool was a browser_action, the browser has been closed and you must launch a new browser if needed.${wasRecent
           ? "\n\nIMPORTANT: If the last tool use was a replace_in_file or write_to_file that was interrupted, the file was reverted back to its original state before the interrupted edit, and you do NOT need to re-read the file as you already have its up-to-date contents."
           : ""
-        }${responseText
+        }${responseText != null && responseText.length > 0
           ? `\n\nNew instructions for task continuation:\n<user_message>\n${responseText}\n</user_message>`
           : ""}`
     });
@@ -462,9 +476,7 @@ export class Recline {
     await this.initiateTaskLoop(newUserContent);
   }
 
-  // Communicate with webview
-
-  private async saveApiConversationHistory() {
+  private async saveApiConversationHistory(): Promise<void> {
     try {
       const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.apiConversationHistory);
       await fs.writeFile(filePath, JSON.stringify(this.apiConversationHistory));
@@ -475,7 +487,7 @@ export class Recline {
     }
   }
 
-  private async saveReclineMessages() {
+  private async saveReclineMessages(): Promise<void> {
     try {
       const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.uiMessages);
       await fs.writeFile(filePath, JSON.stringify(this.reclineMessages));
@@ -631,14 +643,12 @@ export class Recline {
     return result;
   }
 
-  // Task lifecycle
-
-  async* attemptApiRequest(previousApiReqIndex: number): ApiStream {
+  async* attemptApiRequest(previousApiReqIndex: number): ProviderResponseStream {
     const MCP_CONNECTION_TIMEOUT = 10_000;
     try {
       await pWaitFor(() => this.providerRef.deref()?.mcpHub?.isConnecting !== true, { timeout: MCP_CONNECTION_TIMEOUT });
     }
-    catch (error) {
+    catch {
       console.error("MCP servers failed to connect in time");
     }
 
@@ -647,24 +657,32 @@ export class Recline {
       throw new Error("MCP hub not available");
     }
 
-    const model = await this.api.getModel();
-    let systemPrompt: string = await SYSTEM_PROMPT(cwd, model.info.supportsComputerUse ?? false, mcpHub);
+    if (this.api instanceof StatefulModelProvider) {
+      await this.api.initialize();
+    }
+
+    const model = await this.api.getCurrentModel();
+
+    let systemPrompt: string = await SYSTEM_PROMPT(cwd, model.supportsComputerUse, mcpHub);
     const settingsCustomInstructions: string | undefined = this.customInstructions?.trim();
     const reclineRulesFileInstructions: string | undefined = await this.getReclineRulesInstructions(
       path.resolve(cwd, GlobalFileNames.reclineRules)
     );
 
-    if (settingsCustomInstructions || reclineRulesFileInstructions) {
+    if (
+      (settingsCustomInstructions != null && settingsCustomInstructions.length > 0)
+      || (reclineRulesFileInstructions != null && reclineRulesFileInstructions.length > 0)
+    ) {
       systemPrompt += addUserInstructions(settingsCustomInstructions, reclineRulesFileInstructions);
     }
 
     if (previousApiReqIndex >= 0) {
       const previousRequest = this.reclineMessages[previousApiReqIndex];
-      if (previousRequest && previousRequest.text) {
-        const { tokensIn, tokensOut, cacheWrites, cacheReads }: ReclineApiReqInfo = JSON.parse(previousRequest.text);
-        const totalTokens = (tokensIn || 0) + (tokensOut || 0) + (cacheWrites || 0) + (cacheReads || 0);
-        const contextWindow: number = model.info.contextWindow || 128_000;
-        const maxAllowedSize = contextWindow - (contextWindow * 0.25);
+      if (previousRequest != null && previousRequest.text != null && previousRequest.text.length > 0) {
+        const { tokensIn, tokensOut, cacheWrites, cacheReads }: ReclineApiReqInfo = JSON.parse(previousRequest.text) as ReclineApiReqInfo;
+        const totalTokens: number = (tokensIn ?? 0) + (tokensOut ?? 0) + (cacheWrites ?? 0) + (cacheReads ?? 0);
+        const contextWindow: number = model.contextWindow ?? 128_000;
+        const maxAllowedSize: number = contextWindow - (contextWindow * 0.25);
 
         if (totalTokens >= maxAllowedSize) {
           const truncatedMessages = truncateHalfConversation(this.apiConversationHistory);
@@ -673,7 +691,7 @@ export class Recline {
       }
     }
 
-    const stream = this.api.createMessage(systemPrompt, this.apiConversationHistory);
+    const stream = this.api.createResponseStream(systemPrompt, this.apiConversationHistory);
     const iterator = stream[Symbol.asyncIterator]();
 
     try {
@@ -683,7 +701,11 @@ export class Recline {
     catch (error) {
       const { response } = await this.ask(
         "api_req_failed",
-        error.message ?? JSON.stringify(serializeError(error), null, 2)
+        (
+          typeof error === "string"
+            ? error
+            : JSON.stringify(serializeError(error), null, 2)
+        )
       );
       if (response !== "yesButtonClicked") {
         throw new Error("API request failed");
@@ -693,7 +715,9 @@ export class Recline {
       return;
     }
     finally {
-      await this.api.dispose();
+      if (this.api instanceof StatefulModelProvider) {
+        await this.api.dispose();
+      }
     }
 
     yield * iterator;
@@ -723,24 +747,28 @@ export class Recline {
       }
     };
 
-    let result = "";
-    process.on("line", (line) => {
-      result += `${line}\n`;
+    const resultContentBuilder: string[] = [];
+
+    // Usage of "void" is very unsafe.
+    // The big refactor to event-driven architecture should take care of this.
+    void process.on("line", (line) => {
+      resultContentBuilder.push(line);
       if (!didContinue) {
-        sendCommandOutput(line);
+        void sendCommandOutput(line);
       }
       else {
-        this.say("command_output", line);
+        void this.say("command_output", line);
       }
     });
 
     let completed = false;
-    process.once("completed", () => {
+
+    void process.once("completed", () => {
       completed = true;
     });
 
-    process.once("no_shell_integration", async () => {
-      await this.say("shell_integration_warning");
+    void process.once("no_shell_integration", () => {
+      void this.say("shell_integration_warning");
     });
 
     await process;
@@ -752,7 +780,7 @@ export class Recline {
     // grouping command_output messages despite any gaps anyways)
     await delay(50);
 
-    result = result.trim();
+    const result = resultContentBuilder.join("\n").trim();
 
     if (userFeedback) {
       await this.say("user_feedback", userFeedback.text, userFeedback.images);
@@ -780,26 +808,26 @@ export class Recline {
     }
   }
 
-  async getEnvironmentDetails(includeFileDetails: boolean = false) {
+  async getEnvironmentDetails(includeFileDetails: boolean = false): Promise<string> {
     // Get environment info from cache
     const envInfo = await getCachedEnvironmentInfo();
     let details = "";
 
     // Add detected environment information if available
-    if (envInfo.python || envInfo.javascript) {
+    if ((envInfo.python != null && envInfo.python.length > 0) || envInfo.javascript != null) {
       details += "\n\n# Development Environment";
-      if (envInfo.python) {
+      if (envInfo.python != null) {
         details += `\nPython Environment: ${envInfo.python}`;
       }
-      if (envInfo.javascript) {
+      if (envInfo.javascript != null) {
         const js = envInfo.javascript;
-        if (js.nodeVersion) {
+        if (js.nodeVersion != null) {
           details += `\nNode.js Version: ${js.nodeVersion}`;
         }
-        if (js.typescript) {
+        if (js.typescript != null) {
           details += `\nTypeScript Version: ${js.typescript.version}`;
         }
-        if ((js.packageManagers?.length || 0) > 0) {
+        if ((js.packageManagers?.length ?? 0) > 0) {
           details += "\nPackage Managers:";
           js.packageManagers!.forEach((pm) => {
             details += `\n  ${pm.name} ${pm.version}`;
@@ -917,9 +945,9 @@ export class Recline {
 
     // details += "\n\n# VSCode Workspace Errors"
     // if (diagnosticsDetails) {
-    // 	details += diagnosticsDetails
+    //  details += diagnosticsDetails
     // } else {
-    // 	details += "\n(No errors detected)"
+    //  details += "\n(No errors detected)"
     // }
 
     if (terminalDetails) {
@@ -958,15 +986,13 @@ export class Recline {
     }
   }
 
-  async handleWebviewAskResponse(askResponse: ReclineAskResponse, text?: string, images?: string[]) {
+  async handleWebviewAskResponse(askResponse: ReclineAskResponse, text?: string, images?: string[]): Promise<void> {
     this.askResponse = askResponse;
     this.askResponseText = text != null ? sanitizeUserInput(text) : text;
     this.askResponseImages = images;
   }
 
-  // Tools
-
-  async loadContext(userContent: UserContent, includeFileDetails: boolean = false) {
+  async loadContext(userContent: UserContent, includeFileDetails: boolean = false): Promise<[UserContent, string]> {
     return Promise.all([
       // Process userContent array, which contains various block types:
       // TextBlockParam, ImageBlockParam, ToolUseBlockParam, and ToolResultBlockParam.
@@ -982,7 +1008,7 @@ export class Recline {
             };
           }
           else if (block.type === "tool_result") {
-            const isUserMessage = (text: string) => text.includes("<feedback>") || text.includes("<answer>");
+            const isUserMessage = (text: string): boolean => text.includes("<feedback>") || text.includes("<answer>");
             if (typeof block.content === "string" && isUserMessage(block.content)) {
               return {
                 ...block,
@@ -1014,7 +1040,7 @@ export class Recline {
     ]);
   }
 
-  async presentAssistantMessage() {
+  async presentAssistantMessage(): Promise<void> {
     if (this.abort) {
       throw new Error("Recline instance aborted");
     }
@@ -1037,7 +1063,12 @@ export class Recline {
       // throw new Error("No more content blocks to stream! This shouldn't happen...") // remove and just return after testing
     }
 
-    const model = await this.api.getModel();
+    // Ensure the API is initialized before trying to get the model info.
+    if (this.api instanceof StatefulModelProvider) {
+      await this.api.initialize();
+    }
+
+    const model = await this.api.getCurrentModel();
 
     const block = cloneDeep(this.assistantMessageContent[this.currentStreamingContentIndex]); // need to create copy bc while stream is updating the array, it could be updating the reference block properties too
     switch (block.type) {
@@ -1098,8 +1129,8 @@ export class Recline {
         await this.say("text", content, undefined, block.partial);
         break;
       }
-      case "tool_use":
-        const toolDescription = () => {
+      case "tool_use": {
+        const toolDescription = (): string => {
           switch (block.name) {
             case "execute_command":
               return `[${block.name} for '${block.params.command}']`;
@@ -1110,8 +1141,7 @@ export class Recline {
             case "replace_in_file":
               return `[${block.name} for '${block.params.path}']`;
             case "search_files":
-              return `[${block.name} for '${block.params.regex}'${block.params.file_pattern ? ` in '${block.params.file_pattern}'` : ""
-              }]`;
+              return `[${block.name} for '${block.params.regex}'${block.params.file_pattern != null ? ` in '${block.params.file_pattern}'` : ""}]`;
             case "list_files":
               return `[${block.name} for '${block.params.path}']`;
             case "list_code_definition_names":
@@ -1130,7 +1160,7 @@ export class Recline {
         };
 
         if (this.didRejectTool) {
-          // ignore any tool content after user has rejected tool once
+        // ignore any tool content after user has rejected tool once
           if (!block.partial) {
             this.userMessageContent.push({
               type: "text",
@@ -1138,7 +1168,7 @@ export class Recline {
             });
           }
           else {
-            // partial tool after user rejected a previous tool
+          // partial tool after user rejected a previous tool
             this.userMessageContent.push({
               type: "text",
               text: `Tool ${toolDescription()} was interrupted and not executed due to user rejecting a previous tool.`
@@ -1148,7 +1178,7 @@ export class Recline {
         }
 
         if (this.didAlreadyUseTool) {
-          // ignore any content after a tool has already been used
+        // ignore any content after a tool has already been used
           this.userMessageContent.push({
             type: "text",
             text: `Tool [${block.name}] was not executed because a tool has already been used in this message. Only one tool may be used per message. You must assess the first tool's result before proceeding to use the next tool.`
@@ -1156,7 +1186,7 @@ export class Recline {
           break;
         }
 
-        const pushToolResult = (content: ToolResponse) => {
+        const pushToolResult = (content: ToolResponse): void => {
           this.userMessageContent.push({
             type: "text",
             text: `${toolDescription()} Result:`
@@ -1174,7 +1204,7 @@ export class Recline {
           this.didAlreadyUseTool = true;
         };
 
-        const askApproval = async (type: ReclineAsk, partialMessage?: string) => {
+        const askApproval = async (type: ReclineAsk, partialMessage?: string): Promise<boolean> => {
           const { response, text, images } = await this.ask(type, partialMessage, false);
           if (response !== "yesButtonClicked") {
             if (response === "messageResponse") {
@@ -1183,25 +1213,25 @@ export class Recline {
                 formatResponse.toolResult(formatResponse.toolDeniedWithFeedback(text), images)
               );
               // this.userMessageContent.push({
-              // 	type: "text",
-              // 	text: `${toolDescription()}`,
+              //  type: "text",
+              //  text: `${toolDescription()}`,
               // })
               // this.toolResults.push({
-              // 	type: "tool_result",
-              // 	tool_use_id: toolUseId,
-              // 	content: this.formatToolResponseWithImages(
-              // 		await this.formatToolDeniedFeedback(text),
-              // 		images
-              // 	),
+              //  type: "tool_result",
+              //  tool_use_id: toolUseId,
+              //  content: this.formatToolResponseWithImages(
+              //   await this.formatToolDeniedFeedback(text),
+              //   images
+              //  ),
               // })
               this.didRejectTool = true;
               return false;
             }
             pushToolResult(formatResponse.toolDenied());
             // this.toolResults.push({
-            // 	type: "tool_result",
-            // 	tool_use_id: toolUseId,
-            // 	content: await this.formatToolDenied(),
+            //  type: "tool_result",
+            //  tool_use_id: toolUseId,
+            //  content: await this.formatToolDenied(),
             // })
             this.didRejectTool = true;
             return false;
@@ -1209,35 +1239,36 @@ export class Recline {
           return true;
         };
 
-        const showNotificationForApprovalIfAutoApprovalEnabled = (message: string) => {
+        const showNotificationForApprovalIfAutoApprovalEnabled = (message: string): void => {
           if (this.autoApprovalSettings.enabled && this.autoApprovalSettings.enableNotifications) {
-            showInfo({
+            // Usage of void is very unsafe. The big refactor to event-driven architecture should take care of this.
+            void showInfo({
               title: "Approval Required",
               message
             });
           }
         };
 
-        const handleError = async (action: string, error: Error) => {
+        const handleError = async (action: string, error: Error): Promise<void> => {
           const errorString = `Error ${action}: ${JSON.stringify(serializeError(error))}`;
           await this.say(
             "error",
             `Error ${action}:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`
           );
           // this.toolResults.push({
-          // 	type: "tool_result",
-          // 	tool_use_id: toolUseId,
-          // 	content: await this.formatToolError(errorString),
+          //  type: "tool_result",
+          //  tool_use_id: toolUseId,
+          //  content: await this.formatToolError(errorString),
           // })
           pushToolResult(formatResponse.toolError(errorString));
         };
 
         // If block is partial, remove partial closing tag so its not presented to user
-        const removeClosingTag = (tag: ToolParamName, text?: string) => {
+        const removeClosingTag = async (tag: ToolParamName, text?: string): Promise<string> => {
           if (!block.partial) {
-            return text || "";
+            return text ?? "";
           }
-          if (!text) {
+          if (text == null || text.length === 0) {
             return "";
           }
           // This regex dynamically constructs a pattern to match the closing tag:
@@ -1263,9 +1294,15 @@ export class Recline {
             const relPath: string | undefined = block.params.path;
             const content: string | undefined = block.params.content; // for write_to_file
             let diff: string | undefined = block.params.diff; // for replace_in_file
-            if (!relPath || (!content && !diff)) {
-              // checking for content/diff ensures relPath is complete
-              // wait so we can determine if it's a new file or editing an existing file
+            if (
+              (relPath == null || relPath.length === 0)
+              || (
+                (content == null || content.length === 0)
+                && (diff == null || diff.length === 0)
+              )
+            ) {
+            // checking for content/diff ensures relPath is complete
+            // wait so we can determine if it's a new file or editing an existing file
               break;
             }
             // Check if file exists using cached map or fs.access
@@ -1280,18 +1317,18 @@ export class Recline {
             }
 
             try {
-              // Construct newContent from diff
+            // Construct newContent from diff
               let newContent: string;
-              if (diff) {
+              if (diff != null && diff.length > 0) {
                 if (!model.id.includes("claude")) {
-                  // deepseek models tend to use unescaped html entities in diffs
+                // deepseek models tend to use unescaped html entities in diffs
                   diff = fixModelHtmlEscaping(diff);
                   diff = removeInvalidChars(diff);
                 }
                 try {
                   newContent = await constructNewFileContent(
                     diff,
-                    this.diffViewProvider.originalContent || "",
+                    this.diffViewProvider.originalContent ?? "",
                     !block.partial
                   );
                 }
@@ -1311,12 +1348,12 @@ export class Recline {
                   break;
                 }
               }
-              else if (content) {
+              else if (content != null && content.length > 0) {
                 newContent = content;
 
                 // pre-processing newContent for cases where weaker models might add artifacts like markdown codeblock markers (deepseek/llama) or extra escape characters (gemini)
                 if (newContent.startsWith("```")) {
-                  // this handles cases where it includes language specifiers like ```python ```js
+                // this handles cases where it includes language specifiers like ```python ```js
                   newContent = newContent.split("\n").slice(1).join("\n").trim();
                 }
                 if (newContent.endsWith("```")) {
@@ -1324,13 +1361,13 @@ export class Recline {
                 }
 
                 if (!model.id.includes("claude")) {
-                  // it seems not just llama models are doing this, but also gemini and potentially others
+                // it seems not just llama models are doing this, but also gemini and potentially others
                   newContent = fixModelHtmlEscaping(newContent);
                   newContent = removeInvalidChars(newContent);
                 }
               }
               else {
-                // can't happen, since we already checked for content/diff above. but need to do this for type error
+              // can't happen, since we already checked for content/diff above. but need to do this for type error
                 break;
               }
 
@@ -1338,24 +1375,24 @@ export class Recline {
 
               const sharedMessageProps: ReclineSayTool = {
                 tool: fileExists ? "editedExistingFile" : "newFileCreated",
-                path: getReadablePath(cwd, removeClosingTag("path", relPath)),
-                content: diff || content
+                path: getReadablePath(cwd, await removeClosingTag("path", relPath)),
+                content: (diff ?? "") || content
               };
 
               if (block.partial) {
-                // update gui message
+              // update gui message
                 const partialMessage = JSON.stringify(sharedMessageProps);
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool"); // in case the user changes auto-approval settings mid stream
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool"); // in case the user changes auto-approval settings mid stream
                   await this.say("tool", partialMessage, undefined, block.partial);
                 }
                 else {
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   await this.ask("tool", partialMessage, block.partial).catch(() => { });
                 }
                 // update editor
                 if (!this.diffViewProvider.isEditing) {
-                  // open the editor and prepare to stream content in
+                // open the editor and prepare to stream content in
                   await this.diffViewProvider.open(relPath);
                 }
                 // editor is open, stream content in
@@ -1369,13 +1406,13 @@ export class Recline {
                   await this.diffViewProvider.reset();
                   break;
                 }
-                if (block.name === "replace_in_file" && !diff) {
+                if (block.name === "replace_in_file" && (diff == null || diff.length === 0)) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(await this.sayAndCreateMissingParamError("replace_in_file", "diff"));
                   await this.diffViewProvider.reset();
                   break;
                 }
-                if (block.name === "write_to_file" && !content) {
+                if (block.name === "write_to_file" && (content == null || content.length === 0)) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(await this.sayAndCreateMissingParamError("write_to_file", "content"));
                   await this.diffViewProvider.reset();
@@ -1387,7 +1424,7 @@ export class Recline {
                 // it's important to note how this function works, you can't make the assumption that the block.partial conditional will always be called since it may immediately get complete, non-partial data. So this part of the logic will always be called.
                 // in other words, you must always repeat the block.partial logic here
                 if (!this.diffViewProvider.isEditing) {
-                  // show gui message before showing edit animation
+                // show gui message before showing edit animation
                   const partialMessage = JSON.stringify(sharedMessageProps);
                   await this.ask("tool", partialMessage, true).catch(() => { }); // sending true for partial even though it's not a partial, this shows the edit row before the content is streamed into the editor
                   await this.diffViewProvider.open(relPath);
@@ -1395,21 +1432,21 @@ export class Recline {
                 await this.diffViewProvider.update(newContent, true);
                 await delay(300); // wait for diff view to update
                 this.diffViewProvider.scrollToFirstDiff();
-                showOmissionWarning(this.diffViewProvider.originalContent || "", newContent);
+                showOmissionWarning(this.diffViewProvider.originalContent ?? "", newContent);
 
                 const completeMessage = JSON.stringify({
                   ...sharedMessageProps,
-                  content: diff || content
-                  // ? formatResponse.createPrettyPatch(
-                  // 		relPath,
-                  // 		this.diffViewProvider.originalContent,
-                  // 		newContent,
-                  // 	)
-                  // : undefined,
+                  content: (diff ?? "") || content
+                // ? formatResponse.createPrettyPatch(
+                //   relPath,
+                //   this.diffViewProvider.originalContent,
+                //   newContent,
+                //  )
+                // : undefined,
                 } satisfies ReclineSayTool);
 
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool");
                   await this.say("tool", completeMessage, undefined, false);
                   this.consecutiveAutoApprovedRequestsCount++;
 
@@ -1417,18 +1454,18 @@ export class Recline {
                   await delay(3_500);
                 }
                 else {
-                  // If auto-approval is enabled but this tool wasn't auto-approved, send notification
+                // If auto-approval is enabled but this tool wasn't auto-approved, send notification
                   showNotificationForApprovalIfAutoApprovalEnabled(
                     `Recline wants to ${fileExists ? "edit" : "create"} ${path.basename(relPath)}`
                   );
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   // const didApprove = await askApproval("tool", completeMessage)
 
                   // Need a more customized tool response for file edits to highlight the fact that the file was not updated (particularly important for deepseek)
                   let didApprove = true;
                   const { response, text, images } = await this.ask("tool", completeMessage, false);
                   if (response !== "yesButtonClicked") {
-                    // TODO: add similar context for other tool denial responses, to emphasize ie that a command was not run
+                  // TODO: add similar context for other tool denial responses, to emphasize ie that a command was not run
                     const fileDeniedNote = fileExists
                       ? "The file was not updated, and maintains its original contents."
                       : "The file was not created.";
@@ -1459,7 +1496,7 @@ export class Recline {
                 const { newProblemsMessage, userEdits, autoFormattingEdits, finalContent }
                   = await this.diffViewProvider.saveChanges();
                 this.didEditFile = true; // used to determine if we should wait for busy terminal to update before sending api request
-                if (userEdits) {
+                if (userEdits != null && userEdits.length > 0) {
                   await this.say(
                     "user_feedback_diff",
                     JSON.stringify({
@@ -1469,7 +1506,7 @@ export class Recline {
                     } satisfies ReclineSayTool)
                   );
                   pushToolResult(
-                    `The user made the following updates to your content:\n\n${userEdits}\n\n${autoFormattingEdits
+                    `The user made the following updates to your content:\n\n${userEdits}\n\n${autoFormattingEdits != null && autoFormattingEdits.length > 0
                       ? `The user's editor also applied the following auto-formatting to your content:\n\n${autoFormattingEdits}\n\n(Note: Pay close attention to changes such as single quotes being converted to double quotes, semicolons being removed or added, long lines being broken into multiple lines, adjusting indentation style, adding/removing trailing commas, etc. This will help you ensure future SEARCH/REPLACE operations to this file are accurate.)\n\n`
                       : ""
                     }The updated content, which includes both your original modifications and the additional edits, has been successfully saved to ${relPath.toPosix()}. Here is the full, updated content of the file that was saved:\n\n`
@@ -1484,7 +1521,7 @@ export class Recline {
                 }
                 else {
                   pushToolResult(
-                    `The content was successfully saved to ${relPath.toPosix()}.\n\n${autoFormattingEdits
+                    `The content was successfully saved to ${relPath.toPosix()}.\n\n${autoFormattingEdits != null && autoFormattingEdits.length > 0
                       ? `Along with your edits, the user's editor applied the following auto-formatting to your content:\n\n${autoFormattingEdits}\n\n(Note: Pay close attention to changes such as single quotes being converted to double quotes, semicolons being removed or added, long lines being broken into multiple lines, adjusting indentation style, adding/removing trailing commas, etc. This will help you ensure future SEARCH/REPLACE operations to this file are accurate.)\n\n`
                       : ""
                     }Here is the full, updated content of the file that was saved:\n\n`
@@ -1498,7 +1535,7 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("writing file", error);
+              await handleError("writing file", extractExceptionFromThrow(error));
               await this.diffViewProvider.revertChanges();
               await this.diffViewProvider.reset();
               break;
@@ -1508,7 +1545,7 @@ export class Recline {
             const relPath: string | undefined = block.params.path;
             const sharedMessageProps: ReclineSayTool = {
               tool: "readFile",
-              path: getReadablePath(cwd, removeClosingTag("path", relPath))
+              path: getReadablePath(cwd, await removeClosingTag("path", relPath))
             };
             try {
               if (block.partial) {
@@ -1517,17 +1554,17 @@ export class Recline {
                   content: undefined
                 } satisfies ReclineSayTool);
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool");
                   await this.say("tool", partialMessage, undefined, block.partial);
                 }
                 else {
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   await this.ask("tool", partialMessage, block.partial).catch(() => { });
                 }
                 break;
               }
               else {
-                if (!relPath) {
+                if (relPath == null || relPath.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(await this.sayAndCreateMissingParamError("read_file", "path"));
                   break;
@@ -1539,7 +1576,7 @@ export class Recline {
                   content: absolutePath
                 } satisfies ReclineSayTool);
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool");
                   await this.say("tool", completeMessage, undefined, false); // need to be sending partialValue bool, since undefined has its own purpose in that the message is treated neither as a partial or completion of a partial, but as a single complete message
                   this.consecutiveAutoApprovedRequestsCount++;
                 }
@@ -1547,7 +1584,7 @@ export class Recline {
                   showNotificationForApprovalIfAutoApprovalEnabled(
                     `Recline wants to read ${path.basename(absolutePath)}`
                   );
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   const didApprove = await askApproval("tool", completeMessage);
                   if (!didApprove) {
                     break;
@@ -1560,7 +1597,7 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("reading file", error);
+              await handleError("reading file", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -1570,7 +1607,7 @@ export class Recline {
             const recursive = recursiveRaw?.toLowerCase() === "true";
             const sharedMessageProps: ReclineSayTool = {
               tool: !recursive ? "listFilesTopLevel" : "listFilesRecursive",
-              path: getReadablePath(cwd, removeClosingTag("path", relDirPath))
+              path: getReadablePath(cwd, await removeClosingTag("path", relDirPath))
             };
             try {
               if (block.partial) {
@@ -1589,7 +1626,7 @@ export class Recline {
                 break;
               }
               else {
-                if (!relDirPath) {
+                if (relDirPath == null || relDirPath.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(await this.sayAndCreateMissingParamError("list_files", "path"));
                   break;
@@ -1625,7 +1662,7 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("listing files", error);
+              await handleError("listing files", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -1633,7 +1670,7 @@ export class Recline {
             const relDirPath: string | undefined = block.params.path;
             const sharedMessageProps: ReclineSayTool = {
               tool: "listCodeDefinitionNames",
-              path: getReadablePath(cwd, removeClosingTag("path", relDirPath))
+              path: getReadablePath(cwd, await removeClosingTag("path", relDirPath))
             };
             try {
               if (block.partial) {
@@ -1642,17 +1679,17 @@ export class Recline {
                   content: ""
                 } satisfies ReclineSayTool);
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool");
                   await this.say("tool", partialMessage, undefined, block.partial);
                 }
                 else {
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   await this.ask("tool", partialMessage, block.partial).catch(() => { });
                 }
                 break;
               }
               else {
-                if (!relDirPath) {
+                if (relDirPath == null || relDirPath.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("list_code_definition_names", "path")
@@ -1667,7 +1704,7 @@ export class Recline {
                   content: result
                 } satisfies ReclineSayTool);
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool");
                   await this.say("tool", completeMessage, undefined, false);
                   this.consecutiveAutoApprovedRequestsCount++;
                 }
@@ -1675,7 +1712,7 @@ export class Recline {
                   showNotificationForApprovalIfAutoApprovalEnabled(
                     `Recline wants to view source code definitions in ${path.basename(absolutePath)}/`
                   );
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   const didApprove = await askApproval("tool", completeMessage);
                   if (!didApprove) {
                     break;
@@ -1686,7 +1723,7 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("parsing source code definitions", error);
+              await handleError("parsing source code definitions", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -1696,9 +1733,9 @@ export class Recline {
             const filePattern: string | undefined = block.params.file_pattern;
             const sharedMessageProps: ReclineSayTool = {
               tool: "searchFiles",
-              path: getReadablePath(cwd, removeClosingTag("path", relDirPath)),
-              regex: removeClosingTag("regex", regex),
-              filePattern: removeClosingTag("file_pattern", filePattern)
+              path: getReadablePath(cwd, await removeClosingTag("path", relDirPath)),
+              regex: await removeClosingTag("regex", regex),
+              filePattern: await removeClosingTag("file_pattern", filePattern)
             };
             try {
               if (block.partial) {
@@ -1707,22 +1744,22 @@ export class Recline {
                   content: ""
                 } satisfies ReclineSayTool);
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool");
                   await this.say("tool", partialMessage, undefined, block.partial);
                 }
                 else {
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   await this.ask("tool", partialMessage, block.partial).catch(() => { });
                 }
                 break;
               }
               else {
-                if (!relDirPath) {
+                if (relDirPath == null || relDirPath.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(await this.sayAndCreateMissingParamError("search_files", "path"));
                   break;
                 }
-                if (!regex) {
+                if (regex == null || regex.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(await this.sayAndCreateMissingParamError("search_files", "regex"));
                   break;
@@ -1735,7 +1772,7 @@ export class Recline {
                   content: results
                 } satisfies ReclineSayTool);
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "tool");
                   await this.say("tool", completeMessage, undefined, false);
                   this.consecutiveAutoApprovedRequestsCount++;
                 }
@@ -1743,7 +1780,7 @@ export class Recline {
                   showNotificationForApprovalIfAutoApprovalEnabled(
                     `Recline wants to search files in ${path.basename(absolutePath)}/`
                   );
-                  this.removeLastPartialMessageIfExistsWithType("say", "tool");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "tool");
                   const didApprove = await askApproval("tool", completeMessage);
                   if (!didApprove) {
                     break;
@@ -1754,7 +1791,7 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("searching files", error);
+              await handleError("searching files", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -1764,9 +1801,9 @@ export class Recline {
             const coordinate: string | undefined = block.params.coordinate;
             const text: string | undefined = block.params.text;
             if (!action || !browserActions.includes(action)) {
-              // checking for action to ensure it is complete and valid
+            // checking for action to ensure it is complete and valid
               if (!block.partial) {
-                // if the block is complete and we don't have a valid action this is a mistake
+              // if the block is complete and we don't have a valid action this is a mistake
                 this.consecutiveMistakeCount++;
                 pushToolResult(await this.sayAndCreateMissingParamError("browser_action", "action"));
                 await this.browserSession.closeBrowser();
@@ -1778,19 +1815,19 @@ export class Recline {
               if (block.partial) {
                 if (action === "launch") {
                   if (this.shouldAutoApproveTool(block.name)) {
-                    this.removeLastPartialMessageIfExistsWithType("ask", "browser_action_launch");
+                    await this.removeLastPartialMessageIfExistsWithType("ask", "browser_action_launch");
                     await this.say(
                       "browser_action_launch",
-                      removeClosingTag("url", url),
+                      await removeClosingTag("url", url),
                       undefined,
                       block.partial
                     );
                   }
                   else {
-                    this.removeLastPartialMessageIfExistsWithType("say", "browser_action_launch");
+                    await this.removeLastPartialMessageIfExistsWithType("say", "browser_action_launch");
                     await this.ask(
                       "browser_action_launch",
-                      removeClosingTag("url", url),
+                      await removeClosingTag("url", url),
                       block.partial
                     ).catch(() => { });
                   }
@@ -1800,8 +1837,8 @@ export class Recline {
                     "browser_action",
                     JSON.stringify({
                       action: action as BrowserAction,
-                      coordinate: removeClosingTag("coordinate", coordinate),
-                      text: removeClosingTag("text", text)
+                      coordinate: await removeClosingTag("coordinate", coordinate),
+                      text: await removeClosingTag("text", text)
                     } satisfies ReclineSayBrowserAction),
                     undefined,
                     block.partial
@@ -1812,7 +1849,7 @@ export class Recline {
               else {
                 let browserActionResult: BrowserActionResult;
                 if (action === "launch") {
-                  if (!url) {
+                  if (url == null || url.length === 0) {
                     this.consecutiveMistakeCount++;
                     pushToolResult(
                       await this.sayAndCreateMissingParamError("browser_action", "url")
@@ -1823,7 +1860,7 @@ export class Recline {
                   this.consecutiveMistakeCount = 0;
 
                   if (this.shouldAutoApproveTool(block.name)) {
-                    this.removeLastPartialMessageIfExistsWithType("ask", "browser_action_launch");
+                    await this.removeLastPartialMessageIfExistsWithType("ask", "browser_action_launch");
                     await this.say("browser_action_launch", url, undefined, false);
                     this.consecutiveAutoApprovedRequestsCount++;
                   }
@@ -1831,7 +1868,7 @@ export class Recline {
                     showNotificationForApprovalIfAutoApprovalEnabled(
                       `Recline wants to use a browser and launch ${url}`
                     );
-                    this.removeLastPartialMessageIfExistsWithType("say", "browser_action_launch");
+                    await this.removeLastPartialMessageIfExistsWithType("say", "browser_action_launch");
                     const didApprove = await askApproval("browser_action_launch", url);
                     if (!didApprove) {
                       break;
@@ -1847,7 +1884,7 @@ export class Recline {
                 }
                 else {
                   if (action === "click") {
-                    if (!coordinate) {
+                    if (coordinate == null || coordinate.length === 0) {
                       this.consecutiveMistakeCount++;
                       pushToolResult(
                         await this.sayAndCreateMissingParamError(
@@ -1860,7 +1897,7 @@ export class Recline {
                     }
                   }
                   if (action === "type") {
-                    if (!text) {
+                    if (text == null || text.length === 0) {
                       this.consecutiveMistakeCount++;
                       pushToolResult(
                         await this.sayAndCreateMissingParamError("browser_action", "text")
@@ -1908,9 +1945,11 @@ export class Recline {
                     await this.say("browser_action_result", JSON.stringify(browserActionResult));
                     pushToolResult(
                       formatResponse.toolResult(
-                        `The browser action has been executed. The console logs and screenshot have been captured for your analysis.\n\nConsole logs:\n${browserActionResult.logs || "(No new logs)"
+                        `The browser action has been executed. The console logs and screenshot have been captured for your analysis.\n\nConsole logs:\n${(browserActionResult?.logs ?? "") || "(No new logs)"
                         }\n\n(REMEMBER: if you need to proceed to using non-\`browser_action\` tools or launch a new browser, you MUST first close this browser. For example, if after analyzing the logs and screenshot you need to edit a file, you must first close the browser before you can use the write_to_file tool.)`,
-                        browserActionResult.screenshot ? [browserActionResult.screenshot] : []
+                        browserActionResult.screenshot != null && browserActionResult.screenshot.length > 0
+                          ? [browserActionResult.screenshot]
+                          : []
                       )
                     );
                     break;
@@ -1927,7 +1966,7 @@ export class Recline {
             }
             catch (error) {
               await this.browserSession.closeBrowser(); // if any error occurs, the browser session is terminated
-              await handleError("executing browser action", error);
+              await handleError("executing browser action", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -1939,33 +1978,33 @@ export class Recline {
             try {
               if (block.partial) {
                 if (this.shouldAutoApproveTool(block.name)) {
-                  // since depending on an upcoming parameter, requiresApproval this may become an ask - we cant partially stream a say prematurely. So in this particular case we have to wait for the requiresApproval parameter to be completed before presenting it.
-                  // await this.say(
-                  // 	"command",
-                  // 	removeClosingTag("command", command),
-                  // 	undefined,
-                  // 	block.partial,
-                  // ).catch(() => {})
+                // since depending on an upcoming parameter, requiresApproval this may become an ask - we cant partially stream a say prematurely. So in this particular case we have to wait for the requiresApproval parameter to be completed before presenting it.
+                // await this.say(
+                //  "command",
+                //  removeClosingTag("command", command),
+                //  undefined,
+                //  block.partial,
+                // ).catch(() => {})
                 }
                 else {
-                  // don't need to remove last partial since we couldn't have streamed a say
+                // don't need to remove last partial since we couldn't have streamed a say
                   await this.ask(
                     "command",
-                    removeClosingTag("command", command),
+                    await removeClosingTag("command", command),
                     block.partial
                   ).catch(() => { });
                 }
                 break;
               }
               else {
-                if (!command) {
+                if (command == null || command.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("execute_command", "command")
                   );
                   break;
                 }
-                if (!requiresApprovalRaw) {
+                if (requiresApprovalRaw == null || requiresApprovalRaw.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError(
@@ -1980,7 +2019,7 @@ export class Recline {
                 let didAutoApprove = false;
 
                 if (!requiresApproval && this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "command");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "command");
                   await this.say("command", command, undefined, false);
                   this.consecutiveAutoApprovedRequestsCount++;
                   didAutoApprove = true;
@@ -2002,9 +2041,10 @@ export class Recline {
 
                 let timeoutId: NodeJS.Timeout | undefined;
                 if (didAutoApprove && this.autoApprovalSettings.enableNotifications) {
-                  // if the command was auto-approved, and it's long running we need to notify the user after some time has passed without proceeding
+                // if the command was auto-approved, and it's long running we need to notify the user after some time has passed without proceeding
                   timeoutId = setTimeout(() => {
-                    showWarning({
+                    // Usage of void is unsafe. The refactor to event driver architecture should fix this.
+                    void showWarning({
                       title: "Command is still running",
                       message:
                         "An auto-approved command has been running for 30s, and may need your attention."
@@ -2024,7 +2064,7 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("executing command", error);
+              await handleError("executing command", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -2036,31 +2076,31 @@ export class Recline {
               if (block.partial) {
                 const partialMessage = JSON.stringify({
                   type: "use_mcp_tool",
-                  serverName: removeClosingTag("server_name", server_name),
-                  toolName: removeClosingTag("tool_name", tool_name),
-                  arguments: removeClosingTag("arguments", mcp_arguments)
+                  serverName: await removeClosingTag("server_name", server_name),
+                  toolName: await removeClosingTag("tool_name", tool_name),
+                  arguments: await removeClosingTag("arguments", mcp_arguments)
                 } satisfies ReclineAskUseMcpServer);
 
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
                   await this.say("use_mcp_server", partialMessage, undefined, block.partial);
                 }
                 else {
-                  this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
                   await this.ask("use_mcp_server", partialMessage, block.partial).catch(() => { });
                 }
 
                 break;
               }
               else {
-                if (!server_name) {
+                if (server_name == null || server_name.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("use_mcp_tool", "server_name")
                   );
                   break;
                 }
-                if (!tool_name) {
+                if (tool_name == null || tool_name.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("use_mcp_tool", "tool_name")
@@ -2069,16 +2109,16 @@ export class Recline {
                 }
                 // arguments are optional, but if they are provided they must be valid JSON
                 // if (!mcp_arguments) {
-                // 	this.consecutiveMistakeCount++
-                // 	pushToolResult(await this.sayAndCreateMissingParamError("use_mcp_tool", "arguments"))
-                // 	break
+                //  this.consecutiveMistakeCount++
+                //  pushToolResult(await this.sayAndCreateMissingParamError("use_mcp_tool", "arguments"))
+                //  break
                 // }
                 let parsedArguments: Record<string, unknown> | undefined;
-                if (mcp_arguments) {
+                if (mcp_arguments != null && mcp_arguments.length > 0) {
                   try {
-                    parsedArguments = JSON.parse(mcp_arguments);
+                    parsedArguments = JSON.parse(mcp_arguments) as Record<string, unknown>;
                   }
-                  catch (error) {
+                  catch {
                     this.consecutiveMistakeCount++;
                     await this.say(
                       "error",
@@ -2101,7 +2141,7 @@ export class Recline {
                 } satisfies ReclineAskUseMcpServer);
 
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
                   await this.say("use_mcp_server", completeMessage, undefined, false);
                   this.consecutiveAutoApprovedRequestsCount++;
                 }
@@ -2109,7 +2149,7 @@ export class Recline {
                   showNotificationForApprovalIfAutoApprovalEnabled(
                     `Recline wants to use ${tool_name} on ${server_name}`
                   );
-                  this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
                   const didApprove = await askApproval("use_mcp_server", completeMessage);
                   if (!didApprove) {
                     break;
@@ -2145,7 +2185,7 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("executing MCP tool", error);
+              await handleError("executing MCP tool", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -2156,30 +2196,30 @@ export class Recline {
               if (block.partial) {
                 const partialMessage = JSON.stringify({
                   type: "access_mcp_resource",
-                  serverName: removeClosingTag("server_name", server_name),
-                  uri: removeClosingTag("uri", uri)
+                  serverName: await removeClosingTag("server_name", server_name),
+                  uri: await removeClosingTag("uri", uri)
                 } satisfies ReclineAskUseMcpServer);
 
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
                   await this.say("use_mcp_server", partialMessage, undefined, block.partial);
                 }
                 else {
-                  this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
                   await this.ask("use_mcp_server", partialMessage, block.partial).catch(() => { });
                 }
 
                 break;
               }
               else {
-                if (!server_name) {
+                if (server_name == null || server_name.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("access_mcp_resource", "server_name")
                   );
                   break;
                 }
-                if (!uri) {
+                if (uri == null || uri.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("access_mcp_resource", "uri")
@@ -2194,7 +2234,7 @@ export class Recline {
                 } satisfies ReclineAskUseMcpServer);
 
                 if (this.shouldAutoApproveTool(block.name)) {
-                  this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("ask", "use_mcp_server");
                   await this.say("use_mcp_server", completeMessage, undefined, false);
                   this.consecutiveAutoApprovedRequestsCount++;
                 }
@@ -2202,7 +2242,7 @@ export class Recline {
                   showNotificationForApprovalIfAutoApprovalEnabled(
                     `Recline wants to access ${uri} on ${server_name}`
                   );
-                  this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
+                  await this.removeLastPartialMessageIfExistsWithType("say", "use_mcp_server");
                   const didApprove = await askApproval("use_mcp_server", completeMessage);
                   if (!didApprove) {
                     break;
@@ -2216,22 +2256,22 @@ export class Recline {
                   ?.mcpHub
                   ?.readResource(server_name, uri);
                 const resourceResultPretty
-                  = resourceResult?.contents
+                  = (resourceResult?.contents
                     .map((item) => {
-                      if (item.text) {
+                      if (item.text != null && item.text.length > 0) {
                         return item.text;
                       }
                       return "";
                     })
                     .filter(Boolean)
-                    .join("\n\n") || "(Empty response)";
+                    .join("\n\n") ?? "") || "(Empty response)";
                 await this.say("mcp_server_response", resourceResultPretty);
                 pushToolResult(formatResponse.toolResult(resourceResultPretty));
                 break;
               }
             }
             catch (error) {
-              await handleError("accessing MCP resource", error);
+              await handleError("accessing MCP resource", extractExceptionFromThrow(error));
               break;
             }
           }
@@ -2239,13 +2279,13 @@ export class Recline {
             const question: string | undefined = block.params.question;
             try {
               if (block.partial) {
-                await this.ask("followup", removeClosingTag("question", question), block.partial).catch(
+                await this.ask("followup", await removeClosingTag("question", question), block.partial).catch(
                   () => { }
                 );
                 break;
               }
               else {
-                if (!question) {
+                if (question == null || question.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("ask_followup_question", "question")
@@ -2258,7 +2298,7 @@ export class Recline {
                   this.autoApprovalSettings.enabled
                   && this.autoApprovalSettings.enableNotifications
                 ) {
-                  showInfo({
+                  await showInfo({
                     title: "Recline has a question...",
                     message: question.replace(/\n/g, " ")
                   });
@@ -2271,12 +2311,12 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("asking question", error);
+              await handleError("asking question", extractExceptionFromThrow(error));
               break;
             }
           }
           case "attempt_completion": {
-            /*
+          /*
             this.consecutiveMistakeCount = 0
             let resultToSend = result
             if (command) {
@@ -2301,41 +2341,41 @@ export class Recline {
             try {
               const lastMessage = this.reclineMessages.at(-1);
               if (block.partial) {
-                if (command) {
-                  // the attempt_completion text is done, now we're getting command
-                  // remove the previous partial attempt_completion ask, replace with say, post state to webview, then stream command
+                if (command != null && command.length > 0) {
+                // the attempt_completion text is done, now we're getting command
+                // remove the previous partial attempt_completion ask, replace with say, post state to webview, then stream command
 
                   // const secondLastMessage = this.reclineMessages.at(-2)
                   // NOTE: we do not want to auto approve a command run as part of the attempt_completion tool
                   if (lastMessage && lastMessage.ask === "command") {
-                    // update command
+                  // update command
                     await this.ask(
                       "command",
-                      removeClosingTag("command", command),
+                      await removeClosingTag("command", command),
                       block.partial
                     ).catch(() => { });
                   }
                   else {
-                    // last message is completion_result
-                    // we have command string, which means we have the result as well, so finish it (doesnt have to exist yet)
+                  // last message is completion_result
+                  // we have command string, which means we have the result as well, so finish it (doesnt have to exist yet)
                     await this.say(
                       "completion_result",
-                      removeClosingTag("result", result),
+                      await removeClosingTag("result", result),
                       undefined,
                       false
                     );
                     await this.ask(
                       "command",
-                      removeClosingTag("command", command),
+                      await removeClosingTag("command", command),
                       block.partial
                     ).catch(() => { });
                   }
                 }
                 else {
-                  // no command, still outputting partial result
+                // no command, still outputting partial result
                   await this.say(
                     "completion_result",
-                    removeClosingTag("result", result),
+                    await removeClosingTag("result", result),
                     undefined,
                     block.partial
                   );
@@ -2343,7 +2383,7 @@ export class Recline {
                 break;
               }
               else {
-                if (!result) {
+                if (result == null || result.length === 0) {
                   this.consecutiveMistakeCount++;
                   pushToolResult(
                     await this.sayAndCreateMissingParamError("attempt_completion", "result")
@@ -2356,16 +2396,16 @@ export class Recline {
                   this.autoApprovalSettings.enabled
                   && this.autoApprovalSettings.enableNotifications
                 ) {
-                  showInfo({
+                  await showInfo({
                     title: "Task Completed",
                     message: result.replace(/\n/g, " ")
                   });
                 }
 
                 let commandResult: ToolResponse | undefined;
-                if (command) {
+                if (command != null && command.length > 0) {
                   if (lastMessage && lastMessage.ask !== "command") {
-                    // havent sent a command message yet so first send completion_result then command
+                  // havent sent a command message yet so first send completion_result then command
                     await this.say("completion_result", result, undefined, false);
                   }
 
@@ -2396,7 +2436,7 @@ export class Recline {
                 await this.say("user_feedback", text ?? "", images);
 
                 const toolResults: (Anthropic.TextBlockParam | Anthropic.ImageBlockParam)[] = [];
-                if (commandResult) {
+                if (commandResult != null) {
                   if (typeof commandResult === "string") {
                     toolResults.push({ type: "text", text: commandResult });
                   }
@@ -2419,12 +2459,12 @@ export class Recline {
               }
             }
             catch (error) {
-              await handleError("attempting completion", error);
+              await handleError("attempting completion", extractExceptionFromThrow(error));
               break;
             }
           }
         }
-        break;
+        break; }
     }
 
     /*
@@ -2448,13 +2488,13 @@ export class Recline {
         // there are already more content blocks to stream, so we'll call this function ourselves
         // await this.presentAssistantContent()
 
-        this.presentAssistantMessage();
+        await this.presentAssistantMessage();
         return;
       }
     }
     // block is partial, but the read stream may have finished
     if (this.presentAssistantMessageHasPendingUpdates) {
-      this.presentAssistantMessage();
+      await this.presentAssistantMessage();
     }
   }
 
@@ -2466,20 +2506,23 @@ export class Recline {
       throw new Error("Recline instance aborted");
     }
 
-    const model = await this.api.getModel();
+    // Ensure the API is initialized before trying to get the model info.
+    if (this.api instanceof StatefulModelProvider) {
+      await this.api.initialize();
+    }
+
+    const model = await this.api.getCurrentModel();
 
     if (this.consecutiveMistakeCount >= 3) {
       if (this.autoApprovalSettings.enabled && this.autoApprovalSettings.enableNotifications) {
-        showError({
+        await showError({
           title: "Error",
           message: "Recline is having trouble. Would you like to continue the task?"
         });
       }
       const { response, text, images } = await this.ask(
         "mistake_limit_reached",
-        model.id.includes("claude")
-          ? `This may indicate a failure in his thought process or inability to use a tool properly, which can be mitigated with some user guidance (e.g. "Try breaking down the task into smaller steps").`
-          : "Recline uses complex prompts and iterative task execution that may be challenging for less capable models. For best results, it's recommended to use Claude 3.5 Sonnet for its advanced agentic coding capabilities."
+        `This may indicate a failure in the model's thought process or inability to use a tool properly, which can be mitigated with some user guidance (e.g. "Try breaking down the task into smaller steps").`
       );
       if (response === "messageResponse") {
         userContent.push(
@@ -2500,7 +2543,7 @@ export class Recline {
       && this.consecutiveAutoApprovedRequestsCount >= this.autoApprovalSettings.maxRequests
     ) {
       if (this.autoApprovalSettings.enableNotifications) {
-        showWarning({
+        await showWarning({
           title: "Max Requests Reached",
           message: `Recline has auto-approved ${this.autoApprovalSettings.maxRequests.toString()} API requests.`
         });
@@ -2551,9 +2594,9 @@ export class Recline {
       // update api_req_started. we can't use api_req_finished anymore since it's a unique case where it could come after a streaming message (ie in the middle of being updated or executed)
       // fortunately api_req_finished was always parsed out for the gui anyways, so it remains solely for legacy purposes to keep track of prices in tasks from history
       // (it's worth removing a few months from now)
-      const updateApiReqMsg = (cancelReason?: ReclineApiReqCancelReason, streamingFailedMessage?: string) => {
+      const updateApiReqMsg = (cancelReason?: ReclineApiReqCancelReason, streamingFailedMessage?: string): void => {
         this.reclineMessages[lastApiReqIndex].text = JSON.stringify({
-          ...JSON.parse(this.reclineMessages[lastApiReqIndex].text || "{}"),
+          ...JSON.parse((this.reclineMessages[lastApiReqIndex]?.text ?? "") || "{}"),
           tokensIn: inputTokens,
           tokensOut: outputTokens,
           cacheWrites: cacheWriteTokens,
@@ -2561,7 +2604,7 @@ export class Recline {
           cost:
             totalCost
             ?? calculateApiCost(
-              model.info,
+              model,
               inputTokens,
               outputTokens,
               cacheWriteTokens,
@@ -2572,7 +2615,9 @@ export class Recline {
         } satisfies ReclineApiReqInfo);
       };
 
-      const abortStream = async (cancelReason: ReclineApiReqCancelReason, streamingFailedMessage?: string) => {
+      let assistantMessage: string = "";
+
+      const abortStream = async (cancelReason: ReclineApiReqCancelReason, streamingFailedMessage?: string): Promise<void> => {
         if (this.diffViewProvider.isEditing) {
           await this.diffViewProvider.revertChanges(); // closes diff view
         }
@@ -2624,19 +2669,18 @@ export class Recline {
       await this.diffViewProvider.reset();
 
       const stream = this.attemptApiRequest(previousApiReqIndex); // yields only if the first chunk is successful, otherwise will allow the user to retry the request (most likely due to rate limit error, which gets thrown on the first chunk)
-      let assistantMessage = "";
       try {
         for await (const chunk of stream) {
           switch (chunk.type) {
             case "usage":
-              inputTokens += chunk.inputTokens;
-              outputTokens += chunk.outputTokens;
-              cacheWriteTokens += chunk.cacheWriteTokens ?? 0;
-              cacheReadTokens += chunk.cacheReadTokens ?? 0;
+              inputTokens += chunk.inputTokenCount;
+              outputTokens += chunk.outputTokenCount;
+              cacheWriteTokens += chunk.cacheWriteTokenCount ?? 0;
+              cacheReadTokens += chunk.cacheReadTokenCount ?? 0;
               totalCost = chunk.totalCost;
               break;
-            case "text":
-              assistantMessage += chunk.text;
+            case "text": {
+              assistantMessage += chunk.content;
               // parse raw assistant message into content blocks
               const prevLength = this.assistantMessageContent.length;
               this.assistantMessageContent = parseAssistantMessage(assistantMessage);
@@ -2644,8 +2688,13 @@ export class Recline {
                 this.userMessageContentReady = false; // new content we need to present, reset to false in case previous content set this to true
               }
               // present content to user
-              this.presentAssistantMessage();
+              await this.presentAssistantMessage();
               break;
+            }
+            case "image": {
+              // Image types are ignored for now, but should be handled in the future
+              break;
+            }
           }
 
           if (this.abort) {
@@ -2679,7 +2728,9 @@ export class Recline {
           await this.abortTask(); // if the stream failed, there's various states the task could be in (i.e. could have streamed some tools the user may have executed), so we just resort to replicating a cancel task
           await abortStream(
             "streaming_failed",
-            error.message ?? JSON.stringify(serializeError(error), null, 2)
+            typeof error === "string"
+              ? error
+              : JSON.stringify(serializeError(error), null, 2)
           );
           const history = await this.providerRef.deref()?.getTaskWithId(this.taskId);
           if (history) {
@@ -2704,7 +2755,7 @@ export class Recline {
       });
       // this.assistantMessageContent.forEach((e) => (e.partial = false)) // cant just do this bc a tool could be in the middle of executing ()
       if (partialBlocks.length > 0) {
-        this.presentAssistantMessage(); // if there is content to update then it will complete and update this.userMessageContentReady to true, which we pwaitfor before making the next request. all this is really doing is presenting the last partial message that we just set to complete
+        await this.presentAssistantMessage(); // if there is content to update then it will complete and update this.userMessageContentReady to true, which we pwaitfor before making the next request. all this is really doing is presenting the last partial message that we just set to complete
       }
 
       updateApiReqMsg();
@@ -2726,7 +2777,7 @@ export class Recline {
         // it may be the api stream finished after the last parsed content block was executed, so  we are able to detect out of bounds and set userMessageContentReady to true (note you should not call presentAssistantMessage since if the last block is completed it will be presented again)
         // const completeBlocks = this.assistantMessageContent.filter((block) => !block.partial) // if there are any partial blocks after the stream ended we can consider them invalid
         // if (this.currentStreamingContentIndex >= completeBlocks.length) {
-        // 	this.userMessageContentReady = true
+        //  this.userMessageContentReady = true
         // }
 
         await pWaitFor(() => this.userMessageContentReady);
@@ -2758,13 +2809,13 @@ export class Recline {
 
       return didEndLoop; // will always be false for now
     }
-    catch (error) {
+    catch {
       // this should never happen since the only thing that can throw an error is the attemptApiRequest, which is wrapped in a try catch that sends an ask where if noButtonClicked, will clear current task and destroy this instance. However to avoid unhandled promise rejection, we will end this loop which will end execution of this instance (see startTask)
       return true; // needs to be true so parent loop knows to end task
     }
   }
 
-  async removeLastPartialMessageIfExistsWithType(type: "ask" | "say", askOrSay: ReclineAsk | ReclineSay) {
+  async removeLastPartialMessageIfExistsWithType(type: "ask" | "say", askOrSay: ReclineAsk | ReclineSay): Promise<void> {
     const lastMessage = this.reclineMessages.at(-1);
     if (
       lastMessage?.partial
@@ -2839,10 +2890,10 @@ export class Recline {
     }
   }
 
-  async sayAndCreateMissingParamError(toolName: ToolUseName, paramName: string, relPath?: string) {
+  async sayAndCreateMissingParamError(toolName: ToolUseName, paramName: string, relPath?: string): Promise<string> {
     await this.say(
       "error",
-      `Recline tried to use ${toolName}${relPath ? ` for '${relPath.toPosix()}'` : ""
+      `Recline tried to use ${toolName}${relPath != null && relPath.length > 0 ? ` for '${relPath.toPosix()}'` : ""
       } without value for required parameter '${paramName}'. Retrying...`
     );
     return formatResponse.toolError(formatResponse.missingToolParameterError(paramName));
@@ -2851,6 +2902,9 @@ export class Recline {
   shouldAutoApproveTool(toolName: ToolUseName): boolean {
     if (this.autoApprovalSettings.enabled) {
       switch (toolName) {
+        case "ask_followup_question":
+        case "attempt_completion":
+          return false;
         case "read_file":
         case "list_files":
         case "list_code_definition_names":

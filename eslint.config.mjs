@@ -10,6 +10,7 @@ export default antfu(
       quotes: "double",
       semi: true,
       overrides: {
+        "no-console": ["off"],
         "style/comma-dangle": ["error", "never"],
         "style/padded-blocks": ["off"],
         "style/indent": ["error", 2, {

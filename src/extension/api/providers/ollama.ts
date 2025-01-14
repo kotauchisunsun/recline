@@ -7,8 +7,6 @@ import type { APIModelProviderConfig } from "../api.provider";
 
 import { Ollama } from "ollama";
 
-import { extractMessageFromThrow } from "@shared/utils/exception";
-
 import { APIModelProvider } from "../api.provider";
 import { OllamaTransformer } from "../transformers/ollama";
 
@@ -50,8 +48,6 @@ export class OllamaModelProvider<TConfig extends OllamaModelProviderConfig> exte
   }
 
   async *createResponseStream(systemPrompt: string, messages: MessageParamWithTokenCount[]): ProviderResponseStream {
-
-    await this.initialize();
 
     // Sanity-check
     if (this.client == null) {

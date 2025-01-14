@@ -1,25 +1,25 @@
-import type { ModelInfo } from "@shared/api";
+import type { Model } from "@extension/api/types";
 
 
 export function calculateApiCost(
-  modelInfo: ModelInfo,
+  model: Model,
   inputTokens: number,
   outputTokens: number,
   cacheCreationInputTokens?: number,
   cacheReadInputTokens?: number
 ): number {
-  const modelCacheWritesPrice = modelInfo.cacheWritesPrice;
+  const modelCacheWritesPrice = model.cacheWritesPrice;
   let cacheWritesCost = 0;
-  if (cacheCreationInputTokens && modelCacheWritesPrice) {
+  if (cacheCreationInputTokens != null && modelCacheWritesPrice != null) {
     cacheWritesCost = (modelCacheWritesPrice / 1_000_000) * cacheCreationInputTokens;
   }
-  const modelCacheReadsPrice = modelInfo.cacheReadsPrice;
+  const modelCacheReadsPrice = model.cacheReadsPrice;
   let cacheReadsCost = 0;
-  if (cacheReadInputTokens && modelCacheReadsPrice) {
+  if (cacheReadInputTokens != null && modelCacheReadsPrice != null) {
     cacheReadsCost = (modelCacheReadsPrice / 1_000_000) * cacheReadInputTokens;
   }
-  const baseInputCost = ((modelInfo.inputPrice || 0) / 1_000_000) * inputTokens;
-  const outputCost = ((modelInfo.outputPrice || 0) / 1_000_000) * outputTokens;
+  const baseInputCost = ((model.inputPrice ?? 0) / 1_000_000) * inputTokens;
+  const outputCost = ((model.outputPrice ?? 0) / 1_000_000) * outputTokens;
   const totalCost = cacheWritesCost + cacheReadsCost + baseInputCost + outputCost;
   return totalCost;
 }

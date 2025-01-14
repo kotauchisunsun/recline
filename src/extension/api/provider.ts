@@ -8,7 +8,7 @@ import { z } from "zod";
 
 
 export interface ModelProviderConfig {
-  modelId: string;
+  modelId?: string; // Providers could potentially lack model selection capabilities.
 }
 
 export abstract class ModelProvider<TConfig extends ModelProviderConfig> {
@@ -24,7 +24,7 @@ export abstract class ModelProvider<TConfig extends ModelProviderConfig> {
 
   getConfigSchema(): ZodSchema<TConfig> {
     return z.object({
-      modelId: z.string().trim().nonempty()
+      modelId: z.string().trim().nonempty().optional()
     }) as ZodSchema<TConfig>;
   }
 

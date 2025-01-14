@@ -58,18 +58,14 @@ export class VSCodeLmModelProvider extends StatefulModelProvider<VSCodeLmModelPr
 
   protected async onInitialize(): Promise<void> {
 
-    if (!this.initialized) {
-      this.client = await this.selectBestModel(
-        this.config.vsCodeLmModelSelector != null
-          ? this.config.vsCodeLmModelSelector
-          : { id: this.config.modelId }
-      );
+    this.client = await this.selectBestModel(
+      this.config.vsCodeLmModelSelector != null
+        ? this.config.vsCodeLmModelSelector
+        : { id: this.config.modelId }
+    );
 
-      if (this.client == null) {
-        throw new Error(`${ERROR_PREFIX} No model found matching the specified selector.`);
-      }
-
-      this.initialized = true;
+    if (this.client == null) {
+      throw new Error(`${ERROR_PREFIX} No model found matching the specified selector.`);
     }
   }
 
@@ -251,9 +247,6 @@ export class VSCodeLmModelProvider extends StatefulModelProvider<VSCodeLmModelPr
 
   async *createResponseStream(systemPrompt: string, messages: MessageParamWithTokenCount[]): ProviderResponseStream {
 
-    // Initializing also constructs the client, meaning we can safely
-    await this.initialize();
-
     // Sanity-check
     if (this.client == null) {
       throw new Error(`${ERROR_PREFIX} Client not initialized.`);
@@ -337,7 +330,8 @@ export class VSCodeLmModelProvider extends StatefulModelProvider<VSCodeLmModelPr
         contextWindow: model.maxInputTokens,
         outputLimit: model.maxInputTokens,
         supportsImages: false,
-        supportsPromptCache: false
+        supportsPromptCache: false,
+        supportsComputerUse: id.includes("claude") // Note: this is dirty and should be replaced with a proper check when available.
       });
     }
 
@@ -348,14 +342,12 @@ export class VSCodeLmModelProvider extends StatefulModelProvider<VSCodeLmModelPr
 
     return super.getConfigSchema().and(
       z.object({
-        vsCodeLmModelSelector: z.discriminatedUnion("type", [
+        vsCodeLmModelSelector: z.union([
           z.object({
-            type: z.literal("id"),
             id: z.string().trim().nonempty(),
             version: z.string().trim().nonempty().optional()
           }),
           z.object({
-            type: z.literal("family"),
             vendor: z.string().trim().nonempty(),
             family: z.string().trim().nonempty(),
             version: z.string().trim().nonempty().optional()
@@ -393,7 +385,8 @@ export class VSCodeLmModelProvider extends StatefulModelProvider<VSCodeLmModelPr
       outputLimit: this.client.maxInputTokens,
 
       supportsImages: false,
-      supportsPromptCache: false
+      supportsPromptCache: false,
+      supportsComputerUse: id.includes("claude") // Note: this is dirty and should be replaced with a proper check when available.
     };
   }
 }

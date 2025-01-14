@@ -7,11 +7,11 @@ import { Transformer } from "../transformer";
 
 export abstract class LMStudioTransformer extends Transformer<ChatMessageData> {
 
-  public static toExternalMessages(messages: MessageParamWithTokenCount[]): ChatMessageData[] {
+  public static toExternalMessages(internalMessages: MessageParamWithTokenCount[]): ChatMessageData[] {
     throw new Error("Method not implemented.");
   }
 
-  public static toInternalMessages(messages: ChatMessageData[]): MessageParamWithTokenCount[] {
+  public static toInternalMessages(externalMessages: ChatMessageData[]): MessageParamWithTokenCount[] {
     throw new Error("Method not implemented.");
   }
 }

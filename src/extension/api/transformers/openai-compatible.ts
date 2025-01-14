@@ -7,11 +7,11 @@ import { Transformer } from "../transformer";
 
 export abstract class OpenAICompatibleTransformer extends Transformer<OpenAI.Chat.ChatCompletionMessageParam> {
 
-  public static toExternalMessages(messages: MessageParamWithTokenCount[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+  public static toExternalMessages(internalMessages: MessageParamWithTokenCount[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
     throw new Error("Method not implemented.");
   }
 
-  public static toInternalMessages(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): MessageParamWithTokenCount[] {
+  public static toInternalMessages(externalMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): MessageParamWithTokenCount[] {
     throw new Error("Method not implemented.");
   }
 }

@@ -7,11 +7,11 @@ import { Transformer } from "../transformer";
 
 export abstract class OllamaTransformer extends Transformer<Message> {
 
-  public static toExternalMessages(messages: MessageParamWithTokenCount[]): Message[] {
+  public static toExternalMessages(internalMessages: MessageParamWithTokenCount[]): Message[] {
     throw new Error("Method not implemented.");
   }
 
-  public static toInternalMessages(messages: Message[]): MessageParamWithTokenCount[] {
+  public static toInternalMessages(externalMessages: Message[]): MessageParamWithTokenCount[] {
     throw new Error("Method not implemented.");
   }
 }
